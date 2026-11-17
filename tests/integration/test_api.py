@@ -1,10 +1,15 @@
+import os
 from datetime import date
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
 
-client = TestClient(app)
+# Utan BASE_URL testas appen direkt i Python (TestClient).
+# Med BASE_URL (t.ex. http://localhost:8000) körs samma tester mot en riktig container.
+BASE_URL = os.getenv("BASE_URL")
+client = httpx.Client(base_url=BASE_URL) if BASE_URL else TestClient(app)
 
 
 def test_health():
