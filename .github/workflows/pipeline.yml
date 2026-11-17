@@ -5,15 +5,26 @@ on:
     branches: ["**"]
   pull_request:
     branches: [main]
+  # Gör att pipelinen kan startas manuellt från fliken Actions (används i steg 7)
+  workflow_dispatch:
+    inputs:
+      simulate_broken_deploy:
+        description: "Simulera en felkonfigurerad testmiljö (för att visa rollback)"
+        type: boolean
+        default: false
 
 # Minsta möjliga rättighet: jobben får bara läsa koden
 permissions:
   contents: read
 
-# En ny push avbryter en äldre körning på samma branch som inte hunnit bli klar
+# En ny push avbryter en äldre körning på samma branch som inte hunnit bli klar.
+# Undantag: main avbryts aldrig, så en deploy inte kan stoppas halvvägs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/servicekoll
 
 jobs:
   lint:
@@ -96,6 +107,10 @@ jobs:
     name: Bygg och testa image
     runs-on: ubuntu-latest
     needs: [integration-tests]
+    # Det här jobbet får skriva till GitHubs container registry, inget annat jobb får det
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -110,17 +125,17 @@ jobs:
         with:
           context: .
           load: true
-          tags: servicekoll:${{ github.sha }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           build-args: APP_VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Start container
-        run: docker run -d --name servicekoll -p 8000:8000 servicekoll:${{ github.sha }}
+        run: docker run -d --name servicekoll -p 8000:8000 ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
       - name: Wait for health check
         run: |
-          for i in {1..15}; do
+          for _ in {1..15}; do
             if curl --fail --silent http://localhost:8000/health; then
               echo
               echo "Containern svarar"
@@ -164,3 +179,65 @@ jobs:
       - name: Stop container
         if: always()
         run: docker rm -f servicekoll || true
+
+      # Bara på main: samma image som just testades publiceras. Ingen ombyggnad.
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        if: github.ref == 'refs/heads/main'
+        run: docker push "$IMAGE_NAME:$GITHUB_SHA"
+
+  deploy-test:
+    name: Deploy till test
+    runs-on: ubuntu-latest
+    needs: [build-image]
+    if: github.ref == 'refs/heads/main'
+    environment: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull "$IMAGE_NAME:$GITHUB_SHA"
+
+      - name: Deploy
+        env:
+          APP_PORT: ${{ inputs.simulate_broken_deploy && '9000' || '8000' }}
+        run: bash scripts/deploy.sh "$IMAGE_NAME:$GITHUB_SHA"
+
+      # continue-on-error: jobbet fortsätter även om verifieringen fallerar,
+      # så att rollback-steget hinner köras
+      - name: Verify deployment
+        id: verify
+        continue-on-error: true
+        run: bash scripts/verify.sh "$GITHUB_SHA"
+
+      - name: Mark as stable
+        if: steps.verify.outcome == 'success'
+        run: |
+          docker tag "$IMAGE_NAME:$GITHUB_SHA" "$IMAGE_NAME:stable"
+          docker push "$IMAGE_NAME:stable"
+          echo "$GITHUB_SHA är nu stable"
+
+      - name: Rollback
+        if: steps.verify.outcome == 'failure'
+        run: |
+          bash scripts/rollback.sh "$IMAGE_NAME"
+          echo "::error::Deploy av $GITHUB_SHA klarade inte verifieringen. Testmiljön är tillbakarullad till stable."
+          exit 1
