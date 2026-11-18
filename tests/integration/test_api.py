@@ -45,3 +45,8 @@ def test_unknown_type_gives_400():
 def test_invalid_date_gives_422():
     response = client.get("/service-status?type=pulver&last_service=inte-ett-datum")
     assert response.status_code == 422
+
+def test_types_lists_all_extinguishers():
+    response = client.get("/types")
+    assert response.status_code == 200
+    assert set(response.json()["intervals_months"]) == {"pulver", "skum", "vatten", "kolsyra"}
