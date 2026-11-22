@@ -15,7 +15,7 @@ SERVICE_INTERVALS_MONTHS = {
 }
 
 # Så här många dagar innan förfallodatum räknas släckaren som "snart"
-DUE_SOON_DAYS = 10
+DUE_SOON_DAYS = 30
 
 
 def add_months(start: date, months: int) -> date:
